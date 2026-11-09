@@ -24,7 +24,8 @@ import (
 const (
 	// ModeCloudRun dials https://<service>-<hash>-lz.a.run.app with a Google ID token.
 	ModeCloudRun = "cloudrun"
-	// ModeCluster dials <service>.<namespace>.svc.cluster.local in plaintext, with no token.
+	// ModeCluster dials every pod behind <service>-headless.<namespace>.svc.cluster.local
+	// in turn, in plaintext, with no token.
 	ModeCluster = "cluster"
 
 	// EnvMode is read when Config.Mode is empty. Unset means ModeCloudRun.
@@ -32,7 +33,7 @@ const (
 	// EnvNamespace is read when Config.Namespace is empty.
 	EnvNamespace = "SERVICE_NAMESPACE"
 
-	defaultClusterPort = 80
+	defaultClusterPort = 8080
 )
 
 // Config says how to reach other services. Mode and Namespace fall back to the
@@ -44,7 +45,7 @@ type Config struct {
 	CloudRunProjectHash string
 	// Namespace is the target's namespace. Empty: EnvNamespace. Required for ModeCluster.
 	Namespace string
-	// ClusterPort is the target's Service port. Zero means 80.
+	// ClusterPort is the port the target's pods listen on. Zero means 8080.
 	ClusterPort int
 }
 
@@ -137,9 +138,11 @@ func cluster(serviceName string, config *Config) (string, []grpc.DialOption, err
 		port = defaultClusterPort
 	}
 
-	target := fmt.Sprintf("%s.%s.svc.cluster.local:%d", serviceName, namespace, port)
+	target := fmt.Sprintf("%s:///%s-headless.%s.svc.cluster.local:%d", headlessScheme, serviceName, namespace, port)
 	return target, []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithResolvers(newHeadlessBuilder()),
+		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig":[{"round_robin":{}}]}`),
 	}, nil
 }
 

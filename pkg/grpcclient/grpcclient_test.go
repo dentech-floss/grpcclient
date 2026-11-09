@@ -3,19 +3,21 @@ package grpcclient
 import (
 	"context"
 	"errors"
+	"maps"
 	"net"
-	"os"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"golang.org/x/oauth2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
-	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/status"
 )
 
@@ -56,44 +58,252 @@ func startServer(t *testing.T, fail func() error) int {
 	return listener.Addr().(*net.TCPAddr).Port
 }
 
-// Cluster names don't resolve here: hand them to the dialer as they are.
-func TestMain(m *testing.M) {
-	resolver.SetDefaultScheme("passthrough")
-	os.Exit(m.Run())
+// fakeCluster stands in for cluster DNS and the pod network: pods get made-up IPs
+// that the dialer maps to local servers.
+type fakeCluster struct {
+	mu      sync.Mutex
+	pods    map[string]int // pod IP -> local port
+	err     error
+	empty   bool
+	lookups []string
+	dialed  []string
 }
 
-// resolveLocal sends every address to 127.0.0.1, standing in for cluster DNS.
-func resolveLocal(port int, seen *atomic.Value) grpc.DialOption {
+func newFakeCluster(t *testing.T) *fakeCluster {
+	t.Helper()
+	cluster := &fakeCluster{pods: map[string]int{}}
+
+	originalLookup, originalInterval := lookupHost, lookupInterval
+	t.Cleanup(func() { lookupHost, lookupInterval = originalLookup, originalInterval })
+	lookupHost, lookupInterval = cluster.lookup, 5*time.Millisecond
+	return cluster
+}
+
+func (c *fakeCluster) lookup(_ context.Context, host string) ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lookups = append(c.lookups, host)
+	if c.err != nil {
+		return nil, c.err
+	}
+	if c.empty {
+		return nil, nil
+	}
+	return slices.Collect(maps.Keys(c.pods)), nil
+}
+
+func (c *fakeCluster) dialer() grpc.DialOption {
 	return grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-		seen.Store(addr)
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		c.dialed = append(c.dialed, addr)
+		port, ok := c.pods[host]
+		c.mu.Unlock()
+		if !ok {
+			return nil, errors.New("no such pod")
+		}
 		var d net.Dialer
 		return d.DialContext(ctx, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 	})
 }
 
-func TestCluster_CallsTheServiceInPlaintext(t *testing.T) {
-	port := startServer(t, nil)
-	var seen atomic.Value
+// addPod starts a server that counts its calls and makes it resolvable.
+func (c *fakeCluster) addPod(t *testing.T, ip string) *atomic.Int32 {
+	t.Helper()
+	calls := new(atomic.Int32)
+	port := startServer(t, func() error {
+		calls.Add(1)
+		return nil
+	})
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pods[ip] = port
+	return calls
+}
 
+func (c *fakeCluster) removePod(ip string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.pods, ip)
+}
+
+func (c *fakeCluster) setErr(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.err = err
+}
+
+func (c *fakeCluster) setEmpty(empty bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.empty = empty
+}
+
+func dialCluster(t *testing.T, cluster *fakeCluster) healthpb.HealthClient {
+	t.Helper()
 	conn, err := NewConn(
 		context.Background(), "clinic-service",
 		&Config{Mode: ModeCluster, Namespace: "ns"},
-		resolveLocal(port, &seen),
+		cluster.dialer(),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	t.Cleanup(func() { _ = conn.Close() })
+	return healthpb.NewHealthClient(conn)
+}
 
-	if _, err := healthpb.NewHealthClient(conn).Check(context.Background(), &healthpb.HealthCheckRequest{}); err != nil {
-		t.Fatalf("health check: %v", err)
+func check(ctx context.Context, client healthpb.HealthClient) error {
+	_, err := client.Check(ctx, &healthpb.HealthCheckRequest{})
+	return err
+}
+
+func mustCheck(t *testing.T, client healthpb.HealthClient, times int) {
+	t.Helper()
+	for range times {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := check(ctx, client)
+		cancel()
+		if err != nil {
+			t.Fatalf("health check: %v", err)
+		}
 	}
-	if got, want := seen.Load(), "clinic-service.ns.svc.cluster.local:80"; got != want {
+}
+
+// eventually calls the service until done is true.
+func eventually(t *testing.T, client healthpb.HealthClient, what string, done func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !done() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting: %s", what)
+		}
+		mustCheck(t, client, 1)
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestCluster_CallsThePodsOfTheHeadlessServiceInPlaintext(t *testing.T) {
+	cluster := newFakeCluster(t)
+	cluster.addPod(t, "10.0.0.1")
+
+	mustCheck(t, dialCluster(t, cluster), 1)
+
+	cluster.mu.Lock()
+	defer cluster.mu.Unlock()
+	if got, want := cluster.lookups[0], "clinic-service-headless.ns.svc.cluster.local."; got != want {
+		t.Errorf("looked up %q, want %q", got, want)
+	}
+	if got, want := cluster.dialed[0], "10.0.0.1:8080"; got != want {
 		t.Errorf("dialed %q, want %q", got, want)
 	}
 }
 
+func TestCluster_BalancesAcrossPods(t *testing.T) {
+	cluster := newFakeCluster(t)
+	first := cluster.addPod(t, "10.0.0.1")
+	second := cluster.addPod(t, "10.0.0.2")
+	client := dialCluster(t, cluster)
+
+	eventually(t, client, "both pods called", func() bool { return first.Load() > 0 && second.Load() > 0 })
+
+	firstBefore, secondBefore := first.Load(), second.Load()
+	mustCheck(t, client, 100)
+	if got := first.Load() - firstBefore; got != 50 {
+		t.Errorf("first pod got %d of 100 calls, want 50", got)
+	}
+	if got := second.Load() - secondBefore; got != 50 {
+		t.Errorf("second pod got %d of 100 calls, want 50", got)
+	}
+}
+
+func TestCluster_NewPodGetsTrafficAndRemovedPodDoesNot(t *testing.T) {
+	cluster := newFakeCluster(t)
+	first := cluster.addPod(t, "10.0.0.1")
+	client := dialCluster(t, cluster)
+	mustCheck(t, client, 1)
+
+	second := cluster.addPod(t, "10.0.0.2")
+	eventually(t, client, "new pod called", func() bool { return second.Load() > 0 })
+
+	// Give the removal a few lookups to arrive before counting.
+	cluster.removePod("10.0.0.1")
+	time.Sleep(100 * time.Millisecond)
+	before := first.Load()
+	mustCheck(t, client, 20)
+	if got := first.Load() - before; got != 0 {
+		t.Errorf("removed pod got %d calls, want 0", got)
+	}
+}
+
+func TestCluster_FailedOrEmptyLookupKeepsTheAddresses(t *testing.T) {
+	tests := []struct {
+		name string
+		fail func(*fakeCluster)
+		heal func(*fakeCluster)
+	}{
+		{
+			"error",
+			func(c *fakeCluster) { c.setErr(errors.New("dns down")) },
+			func(c *fakeCluster) { c.setErr(nil) },
+		},
+		{
+			"empty answer",
+			func(c *fakeCluster) { c.setEmpty(true) },
+			func(c *fakeCluster) { c.setEmpty(false) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cluster := newFakeCluster(t)
+			first := cluster.addPod(t, "10.0.0.1")
+			client := dialCluster(t, cluster)
+			mustCheck(t, client, 1)
+
+			tt.fail(cluster)
+			time.Sleep(50 * time.Millisecond)
+			before := first.Load()
+			mustCheck(t, client, 5)
+			if got := first.Load() - before; got != 5 {
+				t.Errorf("pod got %d calls during the failure, want 5", got)
+			}
+
+			tt.heal(cluster)
+			second := cluster.addPod(t, "10.0.0.2")
+			eventually(t, client, "lookups resumed", func() bool { return second.Load() > 0 })
+		})
+	}
+}
+
+func TestCluster_FirstLookupFailingFailsCallsThenRecovers(t *testing.T) {
+	cluster := newFakeCluster(t)
+	cluster.setErr(errors.New("dns down"))
+	client := dialCluster(t, cluster)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := check(ctx, client); status.Code(err) != codes.Unavailable {
+		t.Errorf("err = %v, want Unavailable", err)
+	}
+
+	cluster.setErr(nil)
+	calls := cluster.addPod(t, "10.0.0.1")
+	deadline := time.Now().Add(5 * time.Second)
+	for calls.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the client to recover")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_ = check(ctx, client)
+		cancel()
+	}
+}
+
 func TestCluster_RetriesUnavailable(t *testing.T) {
+	cluster := newFakeCluster(t)
 	var calls atomic.Int32
 	port := startServer(t, func() error {
 		if calls.Add(1) < 3 {
@@ -101,21 +311,10 @@ func TestCluster_RetriesUnavailable(t *testing.T) {
 		}
 		return nil
 	})
-	var seen atomic.Value
+	cluster.pods["10.0.0.1"] = port
 
-	conn, err := NewConn(
-		context.Background(), "clinic-service",
-		&Config{Mode: ModeCluster, Namespace: "ns"},
-		resolveLocal(port, &seen),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
+	mustCheck(t, dialCluster(t, cluster), 1)
 
-	if _, err := healthpb.NewHealthClient(conn).Check(context.Background(), &healthpb.HealthCheckRequest{}); err != nil {
-		t.Fatalf("health check: %v", err)
-	}
 	if got := calls.Load(); got != 3 {
 		t.Errorf("server saw %d calls, want 3", got)
 	}
@@ -131,7 +330,7 @@ func TestCluster_ModeAndNamespaceFromEnvironment(t *testing.T) {
 	}
 	defer conn.Close()
 
-	if got, want := conn.Target(), "svc.from-env.svc.cluster.local:80"; got != want {
+	if got, want := conn.Target(), "headless:///svc-headless.from-env.svc.cluster.local:8080"; got != want {
 		t.Errorf("target = %q, want %q", got, want)
 	}
 }
@@ -140,13 +339,13 @@ func TestCluster_ConfigBeatsEnvironmentAndPortIsUsed(t *testing.T) {
 	t.Setenv(EnvMode, ModeCloudRun)
 	t.Setenv(EnvNamespace, "from-env")
 
-	conn, err := NewConn(context.Background(), "svc", &Config{Mode: ModeCluster, Namespace: "ns", ClusterPort: 8080})
+	conn, err := NewConn(context.Background(), "svc", &Config{Mode: ModeCluster, Namespace: "ns", ClusterPort: 9090})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
 
-	if got, want := conn.Target(), "svc.ns.svc.cluster.local:8080"; got != want {
+	if got, want := conn.Target(), "headless:///svc-headless.ns.svc.cluster.local:9090"; got != want {
 		t.Errorf("target = %q, want %q", got, want)
 	}
 }
