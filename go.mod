@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.72.0
-	golang.org/x/oauth2 v0.36.0
+	golang.org/x/oauth2 v0.37.0
 	google.golang.org/api v0.278.0
 	google.golang.org/grpc v1.84.0
 )
