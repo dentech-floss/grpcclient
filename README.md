@@ -42,8 +42,8 @@ A field that is set wins over the environment. Set the environment in the deploy
 
 - **In `cluster` mode the traffic is unencrypted and unauthenticated.** Restrict who may call a service with a NetworkPolicy.
 - **In `cluster` mode the target needs a headless Service named `<service>-headless`.** That's a Service with `clusterIP: None` that selects the same pods as the normal one. It runs nothing: it's a DNS name that returns every pod's IP. Have your deployment template create one for every service, and deploy the target with it before a client on this version calls it.
-- **In `cluster` mode calls go to all replicas, in turn.** The client looks up the pods every 5 seconds, but the DNS answer can be cached, so a new replica gets traffic within 5 seconds plus your DNS cache time. If a lookup fails, the client keeps the addresses it has.
-- **Let a stopping pod keep serving until clients know its replacement.** A fast rollout can remove the old pods before clients have learned the new ones, and every call in that gap fails. Give pods a `preStop` sleep longer than the time above.
+- **In `cluster` mode calls go to all replicas, in turn.** The client looks up the pods every 5 seconds through DNS. How soon it sees a change also depends on your DNS cache, and a new replica only gets calls once the client has connected to it. If a lookup fails, the client keeps the addresses it has.
+- **Let a stopping pod keep serving until clients know its replacement.** A fast rollout can remove the old pods before clients have learned the new ones, and every call in that gap fails. Use a rolling update, so new pods are ready before old ones stop, and give pods a `preStop` sleep longer than the lookup interval plus your DNS cache time. Set `terminationGracePeriodSeconds` to cover both the sleep and the app's own shutdown. This closes the gap in normal rollouts, but not while lookups are failing.
 
 ## Development
 
