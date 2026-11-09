@@ -15,22 +15,26 @@ import (
 // headlessScheme selects the resolver below in a dial target.
 const headlessScheme = "headless"
 
-// lookupHost and lookupInterval are replaced in tests.
+// These are replaced in tests.
 var (
 	lookupHost     = net.DefaultResolver.LookupHost
 	lookupInterval = 5 * time.Second
+	// firstLookupRetry is the wait while there are no addresses at all, when
+	// every call is failing.
+	firstLookupRetry = time.Second
 )
 
 // headlessBuilder resolves a headless Service to its pod IPs and keeps looking
 // them up. grpc-go's dns resolver only looks again when a connection breaks and
 // at most every 30 seconds, so a new replica would get no traffic until then.
 type headlessBuilder struct {
-	lookup   func(ctx context.Context, host string) ([]string, error)
-	interval time.Duration
+	lookup     func(ctx context.Context, host string) ([]string, error)
+	interval   time.Duration
+	firstRetry time.Duration
 }
 
 func newHeadlessBuilder() *headlessBuilder {
-	return &headlessBuilder{lookup: lookupHost, interval: lookupInterval}
+	return &headlessBuilder{lookup: lookupHost, interval: lookupInterval, firstRetry: firstLookupRetry}
 }
 
 func (b *headlessBuilder) Scheme() string { return headlessScheme }
@@ -47,8 +51,9 @@ func (b *headlessBuilder) Build(
 
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &headlessResolver{
-		lookup:   b.lookup,
-		interval: b.interval,
+		lookup:     b.lookup,
+		interval:   b.interval,
+		firstRetry: b.firstRetry,
 		// The trailing dot makes the name absolute. Without it, ndots:5 in a pod's
 		// resolv.conf sends every lookup through all the search domains first.
 		name:   host + ".",
@@ -62,13 +67,14 @@ func (b *headlessBuilder) Build(
 }
 
 type headlessResolver struct {
-	lookup   func(ctx context.Context, host string) ([]string, error)
-	interval time.Duration
-	name     string
-	port     string
-	cc       resolver.ClientConn
-	cancel   context.CancelFunc
-	done     chan struct{}
+	lookup     func(ctx context.Context, host string) ([]string, error)
+	interval   time.Duration
+	firstRetry time.Duration
+	name       string
+	port       string
+	cc         resolver.ClientConn
+	cancel     context.CancelFunc
+	done       chan struct{}
 
 	// Only run touches these.
 	current []string
@@ -78,14 +84,17 @@ type headlessResolver struct {
 func (r *headlessResolver) run(ctx context.Context) {
 	defer close(r.done)
 
-	ticker := time.NewTicker(r.interval)
-	defer ticker.Stop()
 	for {
 		r.refresh(ctx)
+
+		wait := r.interval
+		if r.current == nil {
+			wait = r.firstRetry
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-time.After(wait):
 		}
 	}
 }
@@ -131,8 +140,8 @@ func (r *headlessResolver) refresh(ctx context.Context) {
 	_ = r.cc.UpdateState(resolver.State{Endpoints: endpoints})
 }
 
-// ResolveNow does nothing: the ticker looks up often enough, and gRPC calls this
-// on every failed connection.
+// ResolveNow does nothing: run looks up often enough, and gRPC calls this on
+// every failed connection.
 func (r *headlessResolver) ResolveNow(resolver.ResolveNowOptions) {}
 
 func (r *headlessResolver) Close() {

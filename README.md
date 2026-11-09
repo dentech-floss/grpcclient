@@ -41,7 +41,7 @@ A field that is set wins over the environment. Set the environment in the deploy
 ## Good to know
 
 - **In `cluster` mode the traffic is unencrypted and unauthenticated.** Restrict who may call a service with a NetworkPolicy.
-- **In `cluster` mode the target needs a headless Service named `<service>-headless`.** It's how the client finds the pods: without it every call fails.
+- **In `cluster` mode the target needs a headless Service named `<service>-headless`.** That's a Service with `clusterIP: None` that selects the same pods as the normal one. It runs nothing: it's a DNS name that returns every pod's IP. Have your deployment template create one for every service, and deploy the target with it before a client on this version calls it.
 - **In `cluster` mode calls go to all replicas, in turn.** The client looks up the pods every 5 seconds, so a new replica gets traffic within that time. If a lookup fails, the client keeps the addresses it has.
 
 ## Development

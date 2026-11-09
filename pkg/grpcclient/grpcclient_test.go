@@ -73,9 +73,9 @@ func newFakeCluster(t *testing.T) *fakeCluster {
 	t.Helper()
 	cluster := &fakeCluster{pods: map[string]int{}}
 
-	originalLookup, originalInterval := lookupHost, lookupInterval
-	t.Cleanup(func() { lookupHost, lookupInterval = originalLookup, originalInterval })
-	lookupHost, lookupInterval = cluster.lookup, 5*time.Millisecond
+	originalLookup, originalInterval, originalRetry := lookupHost, lookupInterval, firstLookupRetry
+	t.Cleanup(func() { lookupHost, lookupInterval, firstLookupRetry = originalLookup, originalInterval, originalRetry })
+	lookupHost, lookupInterval, firstLookupRetry = cluster.lookup, 5*time.Millisecond, 5*time.Millisecond
 	return cluster
 }
 
@@ -229,14 +229,13 @@ func TestCluster_NewPodGetsTrafficAndRemovedPodDoesNot(t *testing.T) {
 	second := cluster.addPod(t, "10.0.0.2")
 	eventually(t, client, "new pod called", func() bool { return second.Load() > 0 })
 
-	// Give the removal a few lookups to arrive before counting.
+	// While the removed pod is still in the list, 20 calls in turn always reach it.
 	cluster.removePod("10.0.0.1")
-	time.Sleep(100 * time.Millisecond)
-	before := first.Load()
-	mustCheck(t, client, 20)
-	if got := first.Load() - before; got != 0 {
-		t.Errorf("removed pod got %d calls, want 0", got)
-	}
+	eventually(t, client, "removed pod no longer called", func() bool {
+		before := first.Load()
+		mustCheck(t, client, 20)
+		return first.Load() == before
+	})
 }
 
 func TestCluster_FailedOrEmptyLookupKeepsTheAddresses(t *testing.T) {
@@ -280,6 +279,7 @@ func TestCluster_FailedOrEmptyLookupKeepsTheAddresses(t *testing.T) {
 
 func TestCluster_FirstLookupFailingFailsCallsThenRecovers(t *testing.T) {
 	cluster := newFakeCluster(t)
+	lookupInterval = time.Hour // only the quicker first-lookup retry can recover in time
 	cluster.setErr(errors.New("dns down"))
 	client := dialCluster(t, cluster)
 
